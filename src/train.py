@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
 from sklearn.model_selection import train_test_split
 import numpy as np
@@ -16,52 +17,69 @@ import os
 DATA_PATH = "sleep_dataset.csv"
 N_TRIALS = 20
 EPOCHS = 20
-BATCH_SIZE = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = torch.cuda.is_available()  # Mixed precision only on GPU
 SAVE_DIR = '/content/drive/MyDrive/Sleep_Disorder_Project'
+
+# GPU-optimized batch sizes
+BATCH_SIZE = 512 if torch.cuda.is_available() else 64
 
 
 def train_torch_model(model, train_loader, val_loader, epochs, lr):
-    """Train a PyTorch model and return best validation F1."""
+    """Train PyTorch model with mixed-precision (AMP) on GPU."""
     model.to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = GradScaler(enabled=USE_AMP)
     best_val_f1 = 0.0
-    
+
     for epoch in range(epochs):
         model.train()
         for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-        
+            X_batch, y_batch = X_batch.to(DEVICE, non_blocking=True), y_batch.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast(enabled=USE_AMP):
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+        # Validation
         model.eval()
         all_preds, all_labels = [], []
-        with torch.no_grad():
+        with torch.no_grad(), autocast(enabled=USE_AMP):
             for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+                X_batch = X_batch.to(DEVICE, non_blocking=True)
                 outputs = model(X_batch)
                 _, preds = torch.max(outputs, 1)
                 all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(y_batch.cpu().numpy())
-        
+                all_labels.extend(y_batch.numpy())
+
         val_f1 = f1_score(all_labels, all_preds, average='weighted')
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
     return best_val_f1
 
 
+def make_loaders(X_train, y_train, X_val, y_val, batch_size=BATCH_SIZE):
+    """Create DataLoaders with pin_memory for GPU transfer speed."""
+    pin = torch.cuda.is_available()
+    train_ds = SleepDataset(X_train, y_train)
+    val_ds = SleepDataset(X_val, y_val)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                          pin_memory=pin, num_workers=2)
+    val_dl = DataLoader(val_ds, batch_size=batch_size,
+                        pin_memory=pin, num_workers=2)
+    return train_dl, val_dl
+
+
 def objective(trial, model_name, X_train_raw, X_val, y_train_raw, y_val, input_dim):
-    """
-    Optuna objective. SMOTE is applied ONLY to the training portion
-    inside each trial, NOT to the validation set.
-    """
-    # Apply SMOTE to training portion only (prevents leakage)
+    """SMOTE applied ONLY to training portion inside each trial."""
     X_train, y_train = apply_smote(X_train_raw, y_train_raw)
-    
+
     if model_name == 'KNN':
         params = {
             'n_neighbors': trial.suggest_int('n_neighbors', 3, 15),
@@ -71,13 +89,12 @@ def objective(trial, model_name, X_train_raw, X_val, y_train_raw, y_val, input_d
         model = get_sklearn_model('KNN', params)
         model.fit(X_train, y_train)
         return f1_score(y_val, model.predict(X_val), average='weighted')
-        
+
     elif model_name == 'SVM':
-        # Use larger subsample for better SVM training
         subsample_size = min(len(X_train), 20000)
         idx = np.random.choice(len(X_train), size=subsample_size, replace=False)
         X_sub, y_sub = X_train[idx], y_train[idx]
-        
+
         params = {
             'C': trial.suggest_float('C', 0.1, 100.0, log=True),
             'kernel': trial.suggest_categorical('kernel', ['linear', 'rbf']),
@@ -86,7 +103,7 @@ def objective(trial, model_name, X_train_raw, X_val, y_train_raw, y_val, input_d
         model = get_sklearn_model('SVM', params)
         model.fit(X_sub, y_sub)
         return f1_score(y_val, model.predict(X_val), average='weighted')
-        
+
     elif model_name == 'RF':
         params = {
             'n_estimators': trial.suggest_int('n_estimators', 100, 300),
@@ -97,16 +114,13 @@ def objective(trial, model_name, X_train_raw, X_val, y_train_raw, y_val, input_d
         model = get_sklearn_model('RF', params)
         model.fit(X_train, y_train)
         return f1_score(y_val, model.predict(X_val), average='weighted')
-        
+
     elif model_name in ['ANN', 'CNN']:
         lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
         dropout = trial.suggest_float('dropout_rate', 0.1, 0.5)
-        
-        train_ds = SleepDataset(X_train, y_train)
-        val_ds = SleepDataset(X_val, y_val)
-        train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-        val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE)
-        
+
+        train_dl, val_dl = make_loaders(X_train, y_train, X_val, y_val)
+
         if model_name == 'ANN':
             model = ANN(input_dim,
                         trial.suggest_int('hidden_layers', 1, 3),
@@ -121,19 +135,26 @@ def objective(trial, model_name, X_train_raw, X_val, y_train_raw, y_val, input_d
 
 
 def run_all():
-    """Main training pipeline."""
+    """Main training pipeline with GPU acceleration."""
+    print(f"Using device: {DEVICE}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Mixed Precision (AMP): Enabled")
+        print(f"Batch Size: {BATCH_SIZE}")
+    else:
+        print("WARNING: No GPU detected. Training will be slower.")
+
     # 1. Load data (NO SMOTE yet)
     X_train_raw, X_test, y_train_raw, y_test, le = load_and_process_data(DATA_PATH)
     input_dim = X_train_raw.shape[1]
     print(f"Input dimension: {input_dim}")
-    print(f"Device: {DEVICE}")
-    
+
     # 2. Split raw training data for optimization (before SMOTE)
     X_opt_train, X_opt_val, y_opt_train, y_opt_val = train_test_split(
         X_train_raw, y_train_raw, test_size=0.2, random_state=42, stratify=y_train_raw
     )
     print(f"Optimization split: train={X_opt_train.shape[0]}, val={X_opt_val.shape[0]}")
-    
+
     models = ['KNN', 'SVM', 'RF', 'ANN', 'CNN']
     results = {}
 
@@ -141,25 +162,25 @@ def run_all():
         print(f"\n{'='*50}")
         print(f"Optimizing {m}...")
         print(f"{'='*50}")
-        
+
         study = optuna.create_study(direction='maximize')
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
         study.optimize(
             lambda t: objective(t, m, X_opt_train, X_opt_val, y_opt_train, y_opt_val, input_dim),
             n_trials=N_TRIALS
         )
         print(f"Best Params: {study.best_params}")
         print(f"Best Optimization F1: {study.best_value:.4f}")
-        
+
         # 3. Retrain best model on FULL training data (with SMOTE)
         print(f"\nRetraining final {m} on full training data...")
         X_train_full, y_train_full = apply_smote(X_train_raw, y_train_raw)
-        
+
         if m in ['KNN', 'SVM', 'RF']:
             best_model = get_sklearn_model(m, study.best_params)
             best_model.fit(X_train_full, y_train_full)
             preds = best_model.predict(X_test)
-            
-            # Save
+
             model_path = os.path.join(SAVE_DIR, f'{m}_best_model.joblib')
             joblib.dump(best_model, model_path)
             print(f"Saved {m} to {model_path}")
@@ -169,32 +190,27 @@ def run_all():
                 best_model = ANN(input_dim, p['hidden_layers'], p['units_per_layer'], p['dropout_rate'])
             else:
                 best_model = CNN(input_dim, p['filters'], p['kernel_size'], p['dropout_rate'])
-            
-            ds_train = SleepDataset(X_train_full, y_train_full)
-            ds_test = SleepDataset(X_test, y_test)
-            dl_train = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True)
-            dl_test = DataLoader(ds_test, batch_size=BATCH_SIZE)
-            
+
+            dl_train, dl_test = make_loaders(X_train_full, y_train_full, X_test, y_test)
             train_torch_model(best_model, dl_train, dl_test, epochs=EPOCHS, lr=p['lr'])
-            
-            # Save
+
             model_path = os.path.join(SAVE_DIR, f'{m}_best_model.pth')
             torch.save(best_model.state_dict(), model_path)
             print(f"Saved {m} to {model_path}")
-            
+
             best_model.eval()
             preds = []
-            with torch.no_grad():
+            with torch.no_grad(), autocast(enabled=USE_AMP):
                 for Xb, _ in dl_test:
-                    out = best_model(Xb.to(DEVICE))
+                    out = best_model(Xb.to(DEVICE, non_blocking=True))
                     preds.extend(torch.max(out, 1)[1].cpu().numpy())
-        
+
         # 4. Evaluate on test set
         acc = accuracy_score(y_test, preds)
         prec = precision_score(y_test, preds, average='weighted')
         rec = recall_score(y_test, preds, average='weighted')
         f1 = f1_score(y_test, preds, average='weighted')
-        
+
         results[m] = {'Accuracy': acc, 'Precision': prec, 'Recall': rec, 'F1': f1}
         print(f"\n{m} Test Results:")
         print(f"  Accuracy:  {acc:.4f}")
@@ -203,7 +219,7 @@ def run_all():
         print(f"  F1 Score:  {f1:.4f}")
         print(f"\nClassification Report:")
         print(classification_report(y_test, preds, target_names=le.classes_))
-        
+
     # 5. Final summary
     print("\n" + "="*60)
     print("FINAL RESULTS SUMMARY")
