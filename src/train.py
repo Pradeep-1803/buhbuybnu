@@ -4,31 +4,28 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
+from sklearn.model_selection import train_test_split
 import numpy as np
 import pandas as pd
-from src.data_loader import load_and_process_data
+from src.data_loader import load_and_process_data, apply_smote
 from src.models import SleepDataset, ANN, CNN, get_sklearn_model
 import joblib
 import os
 
 # Configuration
 DATA_PATH = "sleep_dataset.csv"
-N_TRIALS = 15  # Reduced for demonstration/speed
-EPOCHS = 10
+N_TRIALS = 20
+EPOCHS = 20
 BATCH_SIZE = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SAVE_DIR = '/content/drive/MyDrive/Sleep_Disorder_Project'
 
-def train_torch_model(model, train_loader, val_loader, epochs, lr, optimizer_name='Adam'):
+
+def train_torch_model(model, train_loader, val_loader, epochs, lr):
+    """Train a PyTorch model and return best validation F1."""
     model.to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    
-    if optimizer_name == 'Adam':
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-    elif optimizer_name == 'AdamW':
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
-    else:
-        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-    
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     best_val_f1 = 0.0
     
     for epoch in range(epochs):
@@ -41,10 +38,8 @@ def train_torch_model(model, train_loader, val_loader, epochs, lr, optimizer_nam
             loss.backward()
             optimizer.step()
         
-        # Validation
         model.eval()
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
@@ -56,167 +51,166 @@ def train_torch_model(model, train_loader, val_loader, epochs, lr, optimizer_nam
         val_f1 = f1_score(all_labels, all_preds, average='weighted')
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            
     return best_val_f1
 
-def objective(trial, model_name, X_train, X_test, y_train, y_test, input_dim):
+
+def objective(trial, model_name, X_train_raw, X_val, y_train_raw, y_val, input_dim):
+    """
+    Optuna objective. SMOTE is applied ONLY to the training portion
+    inside each trial, NOT to the validation set.
+    """
+    # Apply SMOTE to training portion only (prevents leakage)
+    X_train, y_train = apply_smote(X_train_raw, y_train_raw)
+    
     if model_name == 'KNN':
         params = {
-            'n_neighbors': trial.suggest_int('n_neighbors', 3, 20),
+            'n_neighbors': trial.suggest_int('n_neighbors', 3, 15),
             'weights': trial.suggest_categorical('weights', ['uniform', 'distance']),
-            'metric': trial.suggest_categorical('metric', ['euclidean', 'manhattan', 'minkowski'])
+            'metric': trial.suggest_categorical('metric', ['euclidean', 'manhattan'])
         }
         model = get_sklearn_model('KNN', params)
         model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        return f1_score(y_test, preds, average='weighted')
+        return f1_score(y_val, model.predict(X_val), average='weighted')
         
     elif model_name == 'SVM':
-        # Subsample for SVM as it is slow
-        idx = np.random.choice(len(X_train), size=min(len(X_train), 5000), replace=False)
+        # Use larger subsample for better SVM training
+        subsample_size = min(len(X_train), 20000)
+        idx = np.random.choice(len(X_train), size=subsample_size, replace=False)
         X_sub, y_sub = X_train[idx], y_train[idx]
         
         params = {
-            'C': trial.suggest_float('C', 0.1, 10.0, log=True),
-            'kernel': trial.suggest_categorical('kernel', ['linear', 'rbf', 'poly']),
+            'C': trial.suggest_float('C', 0.1, 100.0, log=True),
+            'kernel': trial.suggest_categorical('kernel', ['linear', 'rbf']),
             'gamma': trial.suggest_categorical('gamma', ['scale', 'auto'])
         }
         model = get_sklearn_model('SVM', params)
         model.fit(X_sub, y_sub)
-        preds = model.predict(X_test)
-        return f1_score(y_test, preds, average='weighted')
+        return f1_score(y_val, model.predict(X_val), average='weighted')
         
     elif model_name == 'RF':
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 200),
-            'max_depth': trial.suggest_int('max_depth', 5, 30),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+            'max_depth': trial.suggest_int('max_depth', 10, 50),
             'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
             'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 4)
         }
         model = get_sklearn_model('RF', params)
         model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        return f1_score(y_test, preds, average='weighted')
+        return f1_score(y_val, model.predict(X_val), average='weighted')
         
-    elif model_name == 'ANN':
-        hidden_layers = trial.suggest_int('hidden_layers', 1, 3)
-        units = trial.suggest_int('units_per_layer', 16, 128)
-        dropout = trial.suggest_float('dropout_rate', 0.1, 0.5)
+    elif model_name in ['ANN', 'CNN']:
         lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
-        
-        model = ANN(input_dim, hidden_layers, units, dropout)
-        
-        train_dataset = SleepDataset(X_train, y_train)
-        val_dataset = SleepDataset(X_test, y_test) # Using test as val for optimization
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-        
-        return train_torch_model(model, train_loader, val_loader, EPOCHS, lr)
-        
-    elif model_name == 'CNN':
-        filters = trial.suggest_int('filters', 16, 64)
-        kernel_size = trial.suggest_int('kernel_size', 2, 3)
         dropout = trial.suggest_float('dropout_rate', 0.1, 0.5)
-        lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
         
-        model = CNN(input_dim, filters, kernel_size, dropout)
+        train_ds = SleepDataset(X_train, y_train)
+        val_ds = SleepDataset(X_val, y_val)
+        train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE)
         
-        train_dataset = SleepDataset(X_train, y_train)
-        val_dataset = SleepDataset(X_test, y_test)
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-        
-        return train_torch_model(model, train_loader, val_loader, EPOCHS, lr)
+        if model_name == 'ANN':
+            model = ANN(input_dim,
+                        trial.suggest_int('hidden_layers', 1, 3),
+                        trial.suggest_int('units_per_layer', 32, 256),
+                        dropout)
+        else:
+            model = CNN(input_dim,
+                        trial.suggest_int('filters', 16, 64),
+                        trial.suggest_int('kernel_size', 2, 3),
+                        dropout)
+        return train_torch_model(model, train_dl, val_dl, 10, lr)
 
-def evaluate_best_model(model, model_type, X_train, y_train, X_test, y_test, le):
-    print(f"\nEvaluating Best {model_type} Model...")
-    
-    if model_type in ['KNN', 'SVM', 'RF']:
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-    else: # PyTorch
-        train_dataset = SleepDataset(X_train, y_train)
-        test_dataset = SleepDataset(X_test, y_test)
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-        
-        # Train fully for more epochs
-        train_torch_model(model, train_loader, test_loader, epochs=20, lr=0.001) # Use fixed LR or optimized?
-        
-        model.eval()
-        preds = []
-        with torch.no_grad():
-            for X_batch, _ in test_loader:
-                X_batch = X_batch.to(DEVICE)
-                outputs = model(X_batch)
-                _, p = torch.max(outputs, 1)
-                preds.extend(p.cpu().numpy())
-    
-    # Calculate Metrics
-    acc = accuracy_score(y_test, preds)
-    prec = precision_score(y_test, preds, average='weighted')
-    rec = recall_score(y_test, preds, average='weighted')
-    f1 = f1_score(y_test, preds, average='weighted')
-    
-    print(f"Accuracy: {acc:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall: {rec:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print("\nClassification Report:")
-    print(classification_report(y_test, preds, target_names=le.classes_))
-    
-    return {'Accuracy': acc, 'Precision': prec, 'Recall': rec, 'F1': f1}
 
-def main():
-    if not os.path.exists(DATA_PATH):
-        print(f"Error: {DATA_PATH} not found.")
-        return
-
-    # Data Loading
-    X_train_full, X_test, y_train_full, y_test, le = load_and_process_data(DATA_PATH)
-    input_dim = X_train_full.shape[1]
-    print(f"Input Dimension: {input_dim}")
+def run_all():
+    """Main training pipeline."""
+    # 1. Load data (NO SMOTE yet)
+    X_train_raw, X_test, y_train_raw, y_test, le = load_and_process_data(DATA_PATH)
+    input_dim = X_train_raw.shape[1]
+    print(f"Input dimension: {input_dim}")
+    print(f"Device: {DEVICE}")
     
-    # Split Train into Train/Val for Optimization to avoid Test leakage
-    from sklearn.model_selection import train_test_split
-    X_train_opt, X_val_opt, y_train_opt, y_val_opt = train_test_split(
-        X_train_full, y_train_full, test_size=0.2, random_state=42, stratify=y_train_full
+    # 2. Split raw training data for optimization (before SMOTE)
+    X_opt_train, X_opt_val, y_opt_train, y_opt_val = train_test_split(
+        X_train_raw, y_train_raw, test_size=0.2, random_state=42, stratify=y_train_raw
     )
+    print(f"Optimization split: train={X_opt_train.shape[0]}, val={X_opt_val.shape[0]}")
     
-    models_to_run = ['KNN', 'SVM', 'RF', 'ANN', 'CNN']
+    models = ['KNN', 'SVM', 'RF', 'ANN', 'CNN']
     results = {}
-    
-    for model_name in models_to_run:
-        print(f"\n--- Optimizing {model_name} ---")
-        study = optuna.create_study(direction='maximize')
-        # Optimize on X_train_opt -> X_val_opt
-        study.optimize(lambda trial: objective(trial, model_name, X_train_opt, X_val_opt, y_train_opt, y_val_opt, input_dim), n_trials=N_TRIALS)
-        
-        print(f"Best params for {model_name}: {study.best_params}")
-        
-        # Re-create best model
-        if model_name == 'KNN':
-            best_model = get_sklearn_model(model_name, study.best_params)
-        elif model_name == 'SVM':
-            best_model = get_sklearn_model(model_name, study.best_params)
-        elif model_name == 'RF':
-            best_model = get_sklearn_model(model_name, study.best_params)
-        elif model_name == 'ANN':
-            p = study.best_params
-            best_model = ANN(input_dim, p['hidden_layers'], p['units_per_layer'], p['dropout_rate'])
-        elif model_name == 'CNN':
-            p = study.best_params
-            best_model = CNN(input_dim, p['filters'], p['kernel_size'], p['dropout_rate'])
-            
-        # Final Evaluation on Held-out Test Set (trained on full X_train)
-        metrics = evaluate_best_model(best_model, model_name, X_train_full, y_train_full, X_test, y_test, le)
-        results[model_name] = metrics
 
-    # Save Results
+    for m in models:
+        print(f"\n{'='*50}")
+        print(f"Optimizing {m}...")
+        print(f"{'='*50}")
+        
+        study = optuna.create_study(direction='maximize')
+        study.optimize(
+            lambda t: objective(t, m, X_opt_train, X_opt_val, y_opt_train, y_opt_val, input_dim),
+            n_trials=N_TRIALS
+        )
+        print(f"Best Params: {study.best_params}")
+        print(f"Best Optimization F1: {study.best_value:.4f}")
+        
+        # 3. Retrain best model on FULL training data (with SMOTE)
+        print(f"\nRetraining final {m} on full training data...")
+        X_train_full, y_train_full = apply_smote(X_train_raw, y_train_raw)
+        
+        if m in ['KNN', 'SVM', 'RF']:
+            best_model = get_sklearn_model(m, study.best_params)
+            best_model.fit(X_train_full, y_train_full)
+            preds = best_model.predict(X_test)
+            
+            # Save
+            model_path = os.path.join(SAVE_DIR, f'{m}_best_model.joblib')
+            joblib.dump(best_model, model_path)
+            print(f"Saved {m} to {model_path}")
+        else:
+            p = study.best_params
+            if m == 'ANN':
+                best_model = ANN(input_dim, p['hidden_layers'], p['units_per_layer'], p['dropout_rate'])
+            else:
+                best_model = CNN(input_dim, p['filters'], p['kernel_size'], p['dropout_rate'])
+            
+            ds_train = SleepDataset(X_train_full, y_train_full)
+            ds_test = SleepDataset(X_test, y_test)
+            dl_train = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True)
+            dl_test = DataLoader(ds_test, batch_size=BATCH_SIZE)
+            
+            train_torch_model(best_model, dl_train, dl_test, epochs=EPOCHS, lr=p['lr'])
+            
+            # Save
+            model_path = os.path.join(SAVE_DIR, f'{m}_best_model.pth')
+            torch.save(best_model.state_dict(), model_path)
+            print(f"Saved {m} to {model_path}")
+            
+            best_model.eval()
+            preds = []
+            with torch.no_grad():
+                for Xb, _ in dl_test:
+                    out = best_model(Xb.to(DEVICE))
+                    preds.extend(torch.max(out, 1)[1].cpu().numpy())
+        
+        # 4. Evaluate on test set
+        acc = accuracy_score(y_test, preds)
+        prec = precision_score(y_test, preds, average='weighted')
+        rec = recall_score(y_test, preds, average='weighted')
+        f1 = f1_score(y_test, preds, average='weighted')
+        
+        results[m] = {'Accuracy': acc, 'Precision': prec, 'Recall': rec, 'F1': f1}
+        print(f"\n{m} Test Results:")
+        print(f"  Accuracy:  {acc:.4f}")
+        print(f"  Precision: {prec:.4f}")
+        print(f"  Recall:    {rec:.4f}")
+        print(f"  F1 Score:  {f1:.4f}")
+        print(f"\nClassification Report:")
+        print(classification_report(y_test, preds, target_names=le.classes_))
+        
+    # 5. Final summary
+    print("\n" + "="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
     results_df = pd.DataFrame(results).T
-    print("\nFinal Results Summary:")
-    print(results_df)
-    results_df.to_markdown("results_summary.md")
+    print(results_df.to_string())
+
 
 if __name__ == "__main__":
-    main()
+    run_all()
